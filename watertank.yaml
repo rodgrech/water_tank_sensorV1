@@ -1,0 +1,174 @@
+substitutions:
+  devicename: "watertank"
+  friendly_name: "Water Tank"
+  awake_duration: 120s 
+  sleep_duration: 90min
+  update_interval: 60s
+
+esphome:
+  name: watertank
+  platform: ESP8266
+  board: d1
+  on_boot:
+    then:
+      - script.execute: consider_deep_sleep
+
+# Enable logging
+logger:
+
+ota:
+  on_end:
+    then:
+      - logger.log: 'OTA successful - flipping switch'
+      - homeassistant.service: 
+          service: input_boolean.turn_off
+          data:
+            entity_id: input_boolean.prevent_deep_sleep
+            
+  password: !secret ota_password
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret encryption_key
+wifi:
+  ssid: "!secret SSID"
+  password: "!secret wifi"
+  manual_ip:
+    static_ip: 
+    gateway: 
+    subnet: 
+    dns1: 
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${friendly_name} Fallback Hotspot"
+    password: 
+
+captive_portal:
+web_server:
+  port: 80
+i2c:
+  - id: bus_a
+    sda: 4
+    scl: 5
+    scan: true
+    setup_priority: -200
+
+### Sensors section
+binary_sensor:
+  - platform: homeassistant
+    id: ${devicename}_prevent_deep_sleep
+    name: 'Prevent sensor Deep Sleep'
+    entity_id: input_boolean.${devicename}_prevent_deep_sleep
+    
+
+sensor:    
+  - platform: bmp085
+    temperature:
+      name: "${friendly_name} Temperature"
+      unit_of_measurement: "°C"
+      icon: "mdi:thermometer"
+      device_class: "temperature"
+      state_class: "measurement"
+      accuracy_decimals: 1 
+
+    pressure:
+      name: "${friendly_name} Barometric Pressure"
+      unit_of_measurement: "hPa"
+      icon: "mdi:gauge"
+      device_class: "pressure"
+      state_class: "measurement"
+    update_interval: ${update_interval}
+    address: 0x77
+    setup_priority: -300
+    
+  - platform: dht
+    pin: D5
+    model: AM2302
+#    temperature:
+#      name: "${friendly_name} Temperature"
+#      unit_of_measurement: "°C"
+#      icon: "mdi:thermometer"
+#      device_class: "temperature"
+#      state_class: "measurement"
+#      accuracy_decimals: 1   
+    humidity:
+      name: "${friendly_name} Humidity"
+      unit_of_measurement: "%"
+      icon: "mdi:thermometer"
+      device_class: "humidity"
+      state_class: "measurement"
+    update_interval: ${update_interval}
+
+  - platform: adc
+    pin: A0
+    name: "watertank_voltage"
+    id: watertank_voltage
+    raw: False
+    update_interval: ${update_interval}
+    icon: "mdi:water-percent"
+    accuracy_decimals: 3
+    filters:
+    - multiply: 3.3
+    - median:
+        window_size: 10 #creates a moving average of the last 10 values
+        send_every: 1 #sends the moving average at every measurement (but only if it passes the delta filter below))
+        send_first_at: 1 #after startup immediately start sending the result rather than wait for the first 10 measurements
+    - delta: 0.0015 #only send the result if the voltage difference with the last sent result is higher than this
+        ## Exposed Voltage Reading
+
+##Templates 
+  - platform: template
+    name: "Water Level Sensor Usable CM" #first X cm are below pump inlet and thus unuseable.
+    id: watertank_cm
+    icon: 'mdi:water-well'
+    unit_of_measurement: 'cm'
+    lambda: |-
+        return id(watertank_voltage).state;
+    update_interval: 1s #the delta filter will ensure it only sends values when something changes. 
+    filters: 
+      - calibrate_linear: 
+          # Measured value of X volt maps to y cm
+          - 0.218 -> 0
+          - 0.873 -> 157
+      - delta : 0.001 #only send the result if the difference with the last sent result is higher than this
+  - platform: template
+    name: "Water Level Sensor Usable %"
+    id: watertank_percent
+    icon: 'mdi:water-well'
+    unit_of_measurement: '%'
+    lambda: |-
+        return id(watertank_cm).state / 157.0 * 100; 
+      #divide by max water level height to get a percentage
+    update_interval: 1s #the delta filter will ensure it only sends values when something changes. 
+    filters:
+      - delta : 0.001 #only send the result if the difference with the last sent result is higher than this
+  - platform: template
+    name: "usable liters"
+    id: watertank_liter
+    icon: 'mdi:water-well'
+    unit_of_measurement: 'L'
+    lambda: |-
+        return 3.14159265 * 0.625 * 0.625 * id(watertank_cm).state * 10;
+      #height (meters) times pi times radius (meters) squared times 1000 gives liters.
+    update_interval: 1s #the delta filter will ensure it only sends values when something changes. 
+    filters:
+      - delta : 0.001 #only send the result if the difference with the last sent result is higher than this
+# Deep sleep section
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: ${sleep_duration}
+
+# Script section
+script:
+  - id: consider_deep_sleep
+    mode: queued
+    then:
+      - delay: ${awake_duration}
+      - if:
+          condition:
+            binary_sensor.is_on: ${devicename}_prevent_deep_sleep
+          then:
+            - logger.log: 'Skipping sleep, per prevent_deep_sleep'
+          else:
+            - deep_sleep.enter: deep_sleep_control
+      - script.execute: consider_deep_sleep
